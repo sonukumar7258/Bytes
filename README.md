@@ -11,18 +11,25 @@ https://github.com/ByteCorp-Tech/2024-AI-Challenge-Miraculum-generationis/assets
 
 # Bytes
 
-Bytes is a chat assistant designed to streamline access to various data sources within your company, including Jira, Github, Notion, and your company's website. Users can also upload their own files and leverage the capabilities of the Assistant for them. It is built using Python, with Solara for UI and Langchain for Retrieval Augmented Generation.
+Bytes is a hybrid AI assistant designed to streamline access to company knowledge across Jira, GitHub, Notion, and internal website content. Users can also upload PDFs for ad-hoc Q&A. It is built in Python with Solara UI, LangChain retrieval, and an agentic runtime that can orchestrate runtime tool calls.
 
 ## Features
 - **Multi-source Data Retrieval**: Access data from Jira, Github, Notion, and your company's website seamlessly within the chat interface. Users can enable/disable specific sources as per their preference.
 - **Natural Language Understanding**: Utilizes advanced NLP techniques to understand user queries and provide relevant responses.
 - **Intuitive UI**: Built on Solara for a user-friendly interface, making interaction with the assistant smooth and intuitive.
-- **Augmented Generation**: Powered by Langchain, the assistant not only retrieves data but also generates augmented responses, enhancing user experience.
+- **Hybrid Retrieval + Agentic Orchestration**: Combines FAISS-based RAG with agentic tool orchestration for live, freshness-sensitive queries.
 - **Multiple Open Source Models**: Supports multiple open source models from the Llama Family by Meta, Qwen (`qwen/qwen3-32b`), and Kimi (`moonshotai/kimi-k2-instruct`) via Groq, allowing users to switch between LLMs based on their requirements.
 - **Source Information URLs**: Provides URLs for the source information the assistant uses for its answer to promote transparency and traceability.
 - **Agentic Mode (RAG + MCP-style tools)**: Adds an orchestrated agent loop that can route between local corpus retrieval and live read-only tools for GitHub, Jira, and Notion.
 - **Release Readiness Brief**: Specialized agent workflow to summarize release status, blockers, risks, and next actions with evidence links.
 - **Tool Timeline Transparency**: UI panel shows planning/tool/synthesis steps with status and duration for interview walkthroughs.
+
+## Why RAG-only is not enough here
+- **RAG is snapshot-based**: A local vector store is excellent for stable documentation, but it can lag behind current Jira/GitHub/Notion state unless constantly re-indexed.
+- **Operational questions are cross-system**: Queries like release readiness require combining multiple systems (tickets, PRs, commits, docs), not just nearest text chunks.
+- **Freshness matters**: Questions containing "latest", "recent", or "today" are better answered via runtime reads from live sources.
+- **Traceability matters**: Agentic mode provides tool timeline, confidence, and citation output so you can explain how the answer was produced.
+- **Best of both worlds**: RAG remains the fast, grounded path for static/internal knowledge; agentic mode is used when orchestration and live evidence are required.
 
 
 **Installation and Execution Guide**
@@ -106,41 +113,71 @@ This report tracks tool-choice correctness, citation presence, freshness behavio
 # Methodology and approach
 
 ## Overview
-This document outlines the methodology and approach of Bytes, which leverages Large Language Models (LLMs) to process and respond to various data sources like Jira, GitHub, Notion, and general websites. The system is designed to intelligently manage and utilize data across these platforms, enhancing retrieval capabilities and embedding management.
+Bytes now follows a **hybrid architecture**:
+- **RAG mode** for high-precision answers from local indexed knowledge.
+- **Agentic mode** for runtime tool orchestration across Jira, GitHub, and Notion with citation transparency.
+
+This makes the assistant suitable for both:
+- stable documentation Q&A (RAG),
+- freshness-sensitive operational queries like release readiness (Agentic).
 
 ## Components
-Bytes is composed of several key components that interact to process data, generate embeddings, and facilitate intelligent query handling:
+Bytes is composed of modular components that support both retrieval and agent orchestration.
 
 ### Data Processing
-- **Corpus Loading**: JSON files representing different data sources (e.g., Notion, Jira, GitHub) are loaded into the system.
-- **Data Cleaning**: Data from these sources is cleaned and structured. Specific keys are removed from Notion data to refine the content.
-- **Data Flattening and Parsing**: Complex data structures from Jira and GitHub are flattened, and website data is chunked into manageable pieces for further processing.
+- **Corpus Extraction Scripts**: Source-specific scripts fetch data from Notion, GitHub, and Jira and store it as JSON.
+- **Flattening and Normalization**: Helper utilities convert nested API payloads into searchable textual chunks with metadata.
+- **Chunking**: Text is chunked before embedding to improve retrieval quality.
 
 ### Embedding Management
-- **Embedding Generation**: Utilizes `OpenAIEmbeddings` to transform processed text data into dense vector representations.
-- **FAISS Indexing**: Embeddings are stored in FAISS indices, a highly efficient similarity search library, which allows for quick retrieval of related documents based on vector similarity.
+- **Embedding Generation**: `OpenAIEmbeddings` transforms chunks into vectors.
+- **FAISS Vector Store**: Embeddings are stored locally and loaded at runtime for retrieval.
+- **Source Filtering**: Documents retain source metadata (`notion`, `jira`, `github`, `website`) used for filter-aware retrieval.
 
-### Query Processing
-- **Chunking**: Large texts are split into smaller chunks to manage the load on the LLM and improve the response accuracy.
-- **Embedding Retrieval**: For a given query, the system retrieves the most relevant embeddings from the FAISS store.
-  
-### Integration with LangChain
-- **Chains and Prompts**: The system uses LangChain to create sophisticated chains of operations, such as data retrieval chains and document processing chains.
-- **LLM Integration**: The assistant integrates with various LLMs like Google Generative AI and open source LLMs from Llama family, Qwen, and Kimi for processing and generating responses based on the context provided by the embeddings.
+### RAG Runtime
+- **Retrieval Chain**: LangChain retrieval chain fetches relevant chunks from FAISS.
+- **Strict Context Prompting**: Primary prompt enforces context-only answers and rejects unsupported responses.
+- **Fallback Context Synthesis**: If strict mode returns "no context" despite retrieved chunks, a fallback context-grounded answer pass is used.
+- **URL Extraction and Ranking**: Related links are deduplicated and ranked before rendering.
 
-### Response Generation
-- **Dynamic LLM Switching**: Depending on user preferences, the assistant can switch between different LLM configurations to generate the most accurate and contextually appropriate responses.
-- **PDF Processing**: Capable of extracting text from PDF files, processing the content, and loading it into the vector store for query handling. 
+### Agentic Runtime
+- **Intent Classification**: Query is classified into categories such as knowledge lookup, freshness lookup, release readiness, or write-like intent.
+- **Strategy Selection**: Runtime chooses `corpus_first`, `live_first`, `hybrid`, or `reject` (for write requests in read-only mode).
+- **Tool Execution Layer**:
+  - `search_corpus` for local retrieval,
+  - `mcp_jira_read`, `mcp_github_read`, `mcp_notion_read` for live reads.
+- **MCP-style Client Wrapper**: External tool calls include allowlisting, retries, and timeout control.
+- **Synthesis and Citations**: Final answer is generated from collected evidence with links, confidence, and an optional timeline of steps.
+- **Guardrails**: Write-like actions are blocked by policy and converted into safe read-only responses.
+
+### UI and Interaction
+- **Mode Switching**: User can switch between `rag` and `agentic` modes from the Solara sidebar.
+- **Model Switching**: Runtime model switching supports Gemini, Llama family, Qwen, and Kimi options.
+- **Tool Timeline View**: Agentic mode can show planning/tool/synthesis steps with durations.
+- **PDF Path**: Uploaded PDF creates an in-memory/local vector retrieval chain for ad-hoc Q&A.
 
 ## Operational Flow
-1. **Initialization**: Load environment variables and initialize embeddings.
-2. **Data Loading**: Load and process JSON corpora from multiple sources.
-3. **Embedding Storage**: Generate and store embeddings in FAISS.
-4. **Query Handling**: On receiving a query, chunk the necessary texts, retrieve relevant embeddings, and generate a response using the selected LLM.
-5. **Output**: The system formats and delivers the response, handling any follow-up queries by referencing the stored context and embeddings.
+1. **Startup**
+- Load environment variables and initialize embeddings + default LLM.
+- Load FAISS vector store and prepare retrieval chain.
 
-## Advanced Features
-- **Parallel Processing**: The system is designed to handle multiple tasks in parallel, significantly speeding up data processing and response generation.
-- **Configurable Runtime**: Depending on the operational needs, different components of the AI assistant can be configured dynamically, allowing flexible adaptations to various types of queries and data sources.
+2. **User Query**
+- User selects model, data sources, and assistant mode (RAG or Agentic).
 
-This methodology ensures a robust, scalable, and efficient AI assistant capable of handling complex queries across multiple domains, utilizing advanced AI and machine learning techniques to enhance productivity and decision-making processes.
+3. **Execution Path**
+- **RAG mode**: retrieve -> answer -> fallback (if needed) -> link ranking.
+- **Agentic mode**: classify -> decide strategy -> call tools -> synthesize -> cite -> timeline.
+
+4. **Response Rendering**
+- UI displays answer text, related links, optional timeline, and confidence metadata (agentic path).
+
+## Evaluation and Interview Readiness
+- **Deterministic Scenario Pack**: `evaluate_agentic.py` runs structured prompts that validate routing/tool behavior.
+- **Scoring Dimensions**:
+  - tool-choice correctness,
+  - citation presence,
+  - freshness correctness,
+  - hallucination heuristics.
+- **Report Export**: Generates a markdown report for interview demonstration.
+
+This methodology enables Bytes to operate as a practical production-style assistant: reliable for static knowledge retrieval while also capable of runtime, multi-tool reasoning for dynamic business questions.
