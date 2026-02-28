@@ -1,0 +1,9 @@
+/__pycache__
+.env
+*.json
+/embeddings
+*.faiss
+*.pkl
+/website_data
+context.txt
+/utilities/__pycache__
