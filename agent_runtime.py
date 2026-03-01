@@ -3,6 +3,12 @@ from datetime import datetime, timezone
 import time
 
 from ai_assistant_chain import get_active_llm, switch_llm
+from guardrails import (
+    check_input_guardrail,
+    check_output_citation_gate,
+    extract_memory_candidate,
+    sanitize_memory_text
+)
 from tool_registry import get_agent_tools
 
 load_dotenv()
@@ -158,6 +164,83 @@ def _classify_intent_node(state):
     return state
 
 
+def _input_guardrail_node(state):
+    """
+    Evaluate user input for prompt-injection patterns.
+
+    Args:
+        state (dict): Runtime state.
+
+    Returns:
+        dict: Updated runtime state.
+    """
+    started_at = time.time()
+    result = check_input_guardrail(state.get("query", ""))
+    state["input_guardrail"] = result
+    if result.get("triggered"):
+        state["guardrail_flags"].append("input_guardrail")
+    if result.get("severity") == "high":
+        state["force_safe_response"] = True
+
+    _append_timeline(
+        state,
+        step_type="guardrail",
+        tool="input_guardrail",
+        input_summary=f"query={state.get('query', '')[:90]}",
+        result_summary=f"triggered={result.get('triggered')}, severity={result.get('severity')}",
+        started_at=started_at,
+        status="ok" if not result.get("triggered") else "warning"
+    )
+    return state
+
+
+def _retrieve_memory_node(state):
+    """
+    Retrieve session memory before selecting strategy.
+
+    Args:
+        state (dict): Runtime state.
+
+    Returns:
+        dict: Updated runtime state.
+    """
+    started_at = time.time()
+    if not state.get("memory_enabled"):
+        _append_timeline(
+            state,
+            step_type="memory",
+            tool="search_memory",
+            input_summary="memory disabled",
+            result_summary="memory retrieval skipped",
+            started_at=started_at,
+            status="skipped"
+        )
+        return state
+
+    memory_result = _run_tool(
+        state,
+        "search_memory",
+        {
+            "query": state.get("query", ""),
+            "session_id": state.get("session_id", "default"),
+            "top_k": state.get("memory_top_k", 3)
+        }
+    )
+    state["memory_snippets"] = memory_result.get("snippets", [])
+    state["memory_items"] = memory_result.get("items", [])
+    state["memory_hit"] = len(state["memory_items"]) > 0
+
+    _append_timeline(
+        state,
+        step_type="memory",
+        tool="retrieve_memory",
+        input_summary=f"session_id={state.get('session_id', 'default')}",
+        result_summary=f"memory_hits={len(state['memory_items'])}",
+        started_at=started_at
+    )
+    return state
+
+
 def _decide_strategy_node(state):
     """
     Decide execution strategy based on classified intent.
@@ -171,7 +254,9 @@ def _decide_strategy_node(state):
     started_at = time.time()
     intent = state.get("intent")
 
-    if intent == "write_request":
+    if state.get("force_safe_response"):
+        strategy = "reject_guardrail"
+    elif intent == "write_request":
         strategy = "reject"
     elif intent == "freshness_lookup":
         strategy = "live_first"
@@ -306,13 +391,13 @@ def _retrieve_or_tool_call_node(state):
     sources = state.get("enabled_sources", [])
     strategy = state.get("strategy", "hybrid")
 
-    if strategy == "reject":
+    if strategy in ["reject", "reject_guardrail"]:
         _append_timeline(
             state,
             step_type="plan",
             tool="retrieve_or_tool_call",
-            input_summary="write-like intent detected",
-            result_summary="execution stopped by read-only policy",
+            input_summary=f"strategy={strategy}",
+            result_summary="execution stopped by safety policy",
             started_at=started_at,
             status="skipped"
         )
@@ -375,7 +460,7 @@ def _collect_evidence(state):
         state (dict): Runtime state.
 
     Returns:
-        tuple: (corpus_snippets, live_items)
+        tuple: (corpus_snippets, live_items, memory_snippets)
     """
     corpus_result = state["tool_outputs"].get("search_corpus", {})
     corpus_snippets = corpus_result.get("snippets", [])
@@ -384,7 +469,8 @@ def _collect_evidence(state):
     for live_tool in _live_tool_names(state):
         payload = state["tool_outputs"].get(live_tool, {})
         live_items.extend(payload.get("items", []))
-    return corpus_snippets, live_items
+    memory_snippets = state.get("memory_snippets", [])
+    return corpus_snippets, live_items, memory_snippets
 
 
 def _normalize_llm_content(response):
@@ -417,7 +503,7 @@ def _normalize_llm_content(response):
     return str(content)
 
 
-def _fallback_summary(query, corpus_snippets, live_items, release_mode):
+def _fallback_summary(query, corpus_snippets, live_items, memory_snippets, release_mode):
     """
     Build deterministic fallback summary when LLM synthesis fails.
 
@@ -425,12 +511,13 @@ def _fallback_summary(query, corpus_snippets, live_items, release_mode):
         query (str): User query.
         corpus_snippets (list): Retrieved corpus snippets.
         live_items (list): Live MCP items.
+        memory_snippets (list): Session memory snippets.
         release_mode (bool): Whether release-readiness formatting is required.
 
     Returns:
         str: Fallback answer text.
     """
-    if not corpus_snippets and not live_items:
+    if not corpus_snippets and not live_items and not memory_snippets:
         return "Insufficient context to answer confidently from available tools."
 
     lines = []
@@ -449,10 +536,14 @@ def _fallback_summary(query, corpus_snippets, live_items, release_mode):
         lines.append(f"Answer summary for query: {query}")
         lines.append(f"Live evidence items: {len(live_items)}")
         lines.append(f"Corpus snippets: {len(corpus_snippets)}")
+        lines.append(f"Session memory snippets: {len(memory_snippets)}")
 
     if corpus_snippets:
         lines.append("Relevant context excerpt:")
         lines.append(corpus_snippets[0][:500])
+    elif memory_snippets:
+        lines.append("Relevant memory excerpt:")
+        lines.append(memory_snippets[0][:500])
 
     return "\n".join(lines)
 
@@ -472,6 +563,22 @@ def _synthesize_answer_node(state):
     intent = state.get("intent")
     strategy = state.get("strategy")
 
+    if strategy == "reject_guardrail":
+        state["answer"] = (
+            "I cannot follow prompt-injection or policy-bypass instructions. "
+            "Please ask a direct business question and I will answer using approved tools."
+        )
+        state["confidence"] = "high"
+        _append_timeline(
+            state,
+            step_type="synthesis",
+            tool="synthesize_answer",
+            input_summary="input guardrail rejection path",
+            result_summary="returned safe refusal",
+            started_at=started_at
+        )
+        return state
+
     if strategy == "reject":
         state["answer"] = (
             "I am configured as read-only in this environment. "
@@ -488,8 +595,8 @@ def _synthesize_answer_node(state):
         )
         return state
 
-    corpus_snippets, live_items = _collect_evidence(state)
-    if not corpus_snippets and not live_items:
+    corpus_snippets, live_items, memory_snippets = _collect_evidence(state)
+    if not corpus_snippets and not live_items and not memory_snippets:
         state["answer"] = (
             "Insufficient context from both corpus and live tools. "
             "Please narrow the query or enable more data sources."
@@ -516,12 +623,14 @@ def _synthesize_answer_node(state):
         )
 
     corpus_lines = [snippet[:700] for snippet in corpus_snippets[:6]]
+    memory_lines = [snippet[:500] for snippet in memory_snippets[:4]]
     synthesis_prompt = ""
     if release_mode:
         synthesis_prompt = f"""
 You are a release-readiness analyst.
 Use only the evidence below and do not invent facts.
 If evidence is weak, state uncertainty clearly.
+If session memory conflicts with live evidence, prioritize live evidence.
 
 User query:
 {query}
@@ -531,6 +640,9 @@ Live tool evidence:
 
 Corpus evidence:
 {chr(10).join(corpus_lines) if corpus_lines else "No corpus evidence"}
+
+Session memory evidence:
+{chr(10).join(memory_lines) if memory_lines else "No memory evidence"}
 
 Return exactly these sections:
 1) Release status
@@ -544,6 +656,7 @@ Return exactly these sections:
 Answer the user query strictly from the evidence below.
 Do not hallucinate or infer beyond evidence.
 If uncertain, explicitly say so.
+If session memory conflicts with live evidence, prioritize live evidence.
 
 User query:
 {query}
@@ -553,6 +666,9 @@ Live tool evidence:
 
 Corpus evidence:
 {chr(10).join(corpus_lines) if corpus_lines else "No corpus evidence"}
+
+Session memory evidence:
+{chr(10).join(memory_lines) if memory_lines else "No memory evidence"}
 """
 
     answer = ""
@@ -561,16 +677,17 @@ Corpus evidence:
         response = llm.invoke(synthesis_prompt)
         answer = _normalize_llm_content(response).strip()
     except Exception:
-        answer = _fallback_summary(query, corpus_snippets, live_items, release_mode)
+        answer = _fallback_summary(query, corpus_snippets, live_items, memory_snippets, release_mode)
 
     if not answer:
-        answer = _fallback_summary(query, corpus_snippets, live_items, release_mode)
+        answer = _fallback_summary(query, corpus_snippets, live_items, memory_snippets, release_mode)
 
     has_live = len(live_items) > 0
     has_corpus = len(corpus_snippets) > 0
+    has_memory = len(memory_snippets) > 0
     if has_live and has_corpus:
         confidence = "high"
-    elif has_live or has_corpus:
+    elif has_live or has_corpus or has_memory:
         confidence = "medium"
     else:
         confidence = "low"
@@ -631,6 +748,121 @@ def _cite_sources_node(state):
     return state
 
 
+def _output_guardrail_node(state):
+    """
+    Apply output citation gate for freshness-sensitive responses.
+
+    Args:
+        state (dict): Runtime state.
+
+    Returns:
+        dict: Updated runtime state.
+    """
+    started_at = time.time()
+    gate = check_output_citation_gate(
+        intent=state.get("intent", ""),
+        query_text=state.get("query", ""),
+        answer_text=state.get("answer", ""),
+        citations=state.get("citations", [])
+    )
+    state["citation_gate_passed"] = gate.get("passed", True)
+    if not gate.get("passed", True):
+        state["guardrail_flags"].append("citation_gate")
+        state["answer"] = (
+            "I cannot provide a freshness-sensitive answer without verifiable citations. "
+            "Please enable live sources or refine the query."
+        )
+        state["confidence"] = "low"
+
+    _append_timeline(
+        state,
+        step_type="guardrail",
+        tool="output_citation_gate",
+        input_summary=f"intent={state.get('intent', '')}, citations={len(state.get('citations', []))}",
+        result_summary=f"passed={gate.get('passed', True)} reason={gate.get('reason', '')}",
+        started_at=started_at,
+        status="ok" if gate.get("passed", True) else "warning"
+    )
+    return state
+
+
+def _persist_memory_node(state):
+    """
+    Persist sanitized memory candidate when memory is enabled.
+
+    Args:
+        state (dict): Runtime state.
+
+    Returns:
+        dict: Updated runtime state.
+    """
+    started_at = time.time()
+    if not state.get("memory_enabled"):
+        _append_timeline(
+            state,
+            step_type="memory",
+            tool="write_memory",
+            input_summary="memory disabled",
+            result_summary="memory write skipped",
+            started_at=started_at,
+            status="skipped"
+        )
+        return state
+
+    memory_candidate = extract_memory_candidate(
+        query_text=state.get("query", ""),
+        answer_text=state.get("answer", "")
+    )
+    if not memory_candidate:
+        _append_timeline(
+            state,
+            step_type="memory",
+            tool="write_memory",
+            input_summary="no memory candidate",
+            result_summary="no write",
+            started_at=started_at,
+            status="skipped"
+        )
+        return state
+
+    sanitized = sanitize_memory_text(memory_candidate)
+    if not sanitized.get("safe"):
+        state["guardrail_flags"].append("memory_safety")
+        _append_timeline(
+            state,
+            step_type="guardrail",
+            tool="memory_safety_filter",
+            input_summary=memory_candidate[:120],
+            result_summary=f"blocked reason={sanitized.get('reason', '')}",
+            started_at=started_at,
+            status="warning"
+        )
+        return state
+
+    memory_write_result = _run_tool(
+        state,
+        "write_memory",
+        {
+            "memory_text": sanitized.get("text", ""),
+            "session_id": state.get("session_id", "default"),
+            "tags": ["user_preference"],
+            "ttl_days": state.get("memory_ttl_days", 30)
+        }
+    )
+    state["memory_written"] = bool(memory_write_result.get("written"))
+    if memory_write_result.get("written"):
+        state["memory_write_id"] = memory_write_result.get("memory_id", "")
+    _append_timeline(
+        state,
+        step_type="memory",
+        tool="persist_memory",
+        input_summary=f"candidate={memory_candidate[:80]}",
+        result_summary=f"written={state['memory_written']}",
+        started_at=started_at
+    )
+    return state
+
+
 def _run_manual_flow(state):
     """
     Execute agent flow in deterministic order without LangGraph.
@@ -642,10 +874,14 @@ def _run_manual_flow(state):
         dict: Final runtime state.
     """
     state = _classify_intent_node(state)
+    state = _input_guardrail_node(state)
+    state = _retrieve_memory_node(state)
     state = _decide_strategy_node(state)
     state = _retrieve_or_tool_call_node(state)
     state = _synthesize_answer_node(state)
     state = _cite_sources_node(state)
+    state = _output_guardrail_node(state)
+    state = _persist_memory_node(state)
     return state
 
 
@@ -658,21 +894,36 @@ def _build_langgraph():
     """
     graph = StateGraph(dict)
     graph.add_node("classify_intent", _classify_intent_node)
+    graph.add_node("input_guardrail", _input_guardrail_node)
+    graph.add_node("retrieve_memory", _retrieve_memory_node)
     graph.add_node("decide_strategy", _decide_strategy_node)
     graph.add_node("retrieve_or_tool_call", _retrieve_or_tool_call_node)
     graph.add_node("synthesize_answer", _synthesize_answer_node)
     graph.add_node("cite_sources", _cite_sources_node)
+    graph.add_node("output_guardrail", _output_guardrail_node)
+    graph.add_node("persist_memory", _persist_memory_node)
 
     graph.set_entry_point("classify_intent")
-    graph.add_edge("classify_intent", "decide_strategy")
+    graph.add_edge("classify_intent", "input_guardrail")
+    graph.add_edge("input_guardrail", "retrieve_memory")
+    graph.add_edge("retrieve_memory", "decide_strategy")
     graph.add_edge("decide_strategy", "retrieve_or_tool_call")
     graph.add_edge("retrieve_or_tool_call", "synthesize_answer")
     graph.add_edge("synthesize_answer", "cite_sources")
-    graph.add_edge("cite_sources", END)
+    graph.add_edge("cite_sources", "output_guardrail")
+    graph.add_edge("output_guardrail", "persist_memory")
+    graph.add_edge("persist_memory", END)
     return graph.compile()
 
 
-def run_agent(query, enabled_sources, model_name):
+def run_agent(
+    query,
+    enabled_sources,
+    model_name,
+    session_id="default",
+    memory_enabled=False,
+    memory_top_k=3
+):
     """
     Run the hybrid agentic workflow and return structured output.
 
@@ -680,19 +931,31 @@ def run_agent(query, enabled_sources, model_name):
         query (str): User query.
         enabled_sources (list): Source filters selected in the UI.
         model_name (str): Selected model name.
+        session_id (str, optional): Session identifier for memory.
+        memory_enabled (bool, optional): Enable session memory.
+        memory_top_k (int, optional): Top memory hits.
 
     Returns:
         dict: Agent response payload with answer, citations, timeline, mode, confidence.
     """
     _ensure_model(model_name)
     selected_sources = _normalize_enabled_sources(enabled_sources)
-    tools = get_agent_tools(selected_sources)
+    tools = get_agent_tools(
+        selected_sources,
+        session_id=session_id,
+        memory_enabled=memory_enabled,
+        memory_top_k=memory_top_k
+    )
     tool_map = {tool["name"]: tool for tool in tools}
 
     state = {
         "query": query,
         "enabled_sources": selected_sources,
         "model_name": model_name,
+        "session_id": session_id,
+        "memory_enabled": bool(memory_enabled),
+        "memory_top_k": int(memory_top_k),
+        "memory_ttl_days": 30,
         "intent": "",
         "strategy": "",
         "answer": "",
@@ -702,7 +965,16 @@ def run_agent(query, enabled_sources, model_name):
         "tool_errors": {},
         "circuit_breaker": {},
         "tool_map": tool_map,
-        "citations": []
+        "citations": [],
+        "memory_snippets": [],
+        "memory_items": [],
+        "memory_hit": False,
+        "memory_written": False,
+        "memory_write_id": "",
+        "input_guardrail": {},
+        "citation_gate_passed": True,
+        "guardrail_flags": [],
+        "force_safe_response": False
     }
 
     if LANGGRAPH_AVAILABLE:
@@ -722,5 +994,10 @@ def run_agent(query, enabled_sources, model_name):
         "citations": state.get("citations", []),
         "timeline": state.get("timeline", []),
         "mode_used": mode_used,
-        "confidence": state.get("confidence", "low")
+        "confidence": state.get("confidence", "low"),
+        "memory_hit": state.get("memory_hit", False),
+        "memory_written": state.get("memory_written", False),
+        "citation_gate_passed": state.get("citation_gate_passed", True),
+        "guardrail_triggered": len(state.get("guardrail_flags", [])) > 0,
+        "guardrail_flags": state.get("guardrail_flags", [])
     }

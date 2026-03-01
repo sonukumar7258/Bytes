@@ -68,6 +68,18 @@ class HashEmbeddings:
         """
         return self._embed_text(text)
 
+    def __call__(self, text):
+        """
+        Compatibility hook for FAISS versions expecting callable embeddings.
+
+        Args:
+            text (str): Input text.
+
+        Returns:
+            list: Vector embedding.
+        """
+        return self._embed_text(text)
+
 
 def _utc_now_iso():
     """

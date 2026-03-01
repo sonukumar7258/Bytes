@@ -6,6 +6,7 @@ import solara
 import reacton.ipyvuetify as v
 
 from agent_runtime import run_agent
+from memory_store import clear_memory
 from ai_assistant_chain import (
     answer_from_context_fallback,
     extract_urls,
@@ -21,9 +22,12 @@ jira_checkbox = solara.reactive(False)
 github_checkbox = solara.reactive(False)
 website_checkbox = solara.reactive(False)
 file_upload_checkbox = solara.reactive(False)
-llm = solara.reactive("gemini")
+llm = solara.reactive("llama3-70b-8192")
 assistant_mode = solara.reactive("rag")
 show_timeline = solara.reactive(True)
+memory_enabled = solara.reactive(False)
+session_id = solara.reactive("default")
+memory_top_k = solara.reactive(3)
 
 
 def get_selected_sources():
@@ -194,8 +198,8 @@ def format_timeline_markdown(timeline):
     return "\n".join(lines)
 
 
-# Load LLM with default set to gemini-pro and generate retrieval chain using it, using notion by default
-switch_llm(llm.value, "gemini-pro")
+# Load LLM with default set to llama3-70b-8192 and generate retrieval chain using it, using notion by default
+switch_llm("llama", "llama-3.3-70b-versatile")
 global retrieval_chain_body
 retrieval_chain_body = load_vector_store("all", ["notion"])
 
@@ -256,6 +260,17 @@ def on_value_change_file(value):
         retrieval_chain_body = load_vector_store("all", get_selected_sources())
 
 
+def on_session_id_change(value):
+    """
+    Callback for session id updates used by memory mode.
+
+    Args:
+        value (str): New session id.
+    """
+    cleaned = (value or "").strip()
+    session_id.value = cleaned if cleaned else "default"
+
+
 image_url = "logo2.png"
 
 
@@ -282,6 +297,7 @@ def Page():
     output_urls, set_output_urls = solara.use_state("")
     output_timeline, set_output_timeline = solara.use_state("")
     processing, set_processing = solara.use_state(False)
+    memory_status, set_memory_status = solara.use_state("")
 
     def query_assistant_body(user_input):
         """
@@ -306,15 +322,26 @@ def Page():
                 agent_response = run_agent(
                     query=cleaned_input,
                     enabled_sources=selected_sources,
-                    model_name=llm.value
+                    model_name=llm.value,
+                    session_id=session_id.value,
+                    memory_enabled=memory_enabled.value,
+                    memory_top_k=memory_top_k.value
                 )
                 answer = agent_response.get("answer", "")
                 confidence = agent_response.get("confidence", "low")
                 mode_used = agent_response.get("mode_used", "agentic")
                 citations = agent_response.get("citations", [])
                 timeline = agent_response.get("timeline", [])
+                memory_hit = agent_response.get("memory_hit", False)
+                memory_written = agent_response.get("memory_written", False)
+                guardrail_triggered = agent_response.get("guardrail_triggered", False)
+                citation_gate_passed = agent_response.get("citation_gate_passed", True)
 
-                answer_with_meta = f"{answer}\n\nConfidence: {confidence}\nMode: {mode_used}"
+                answer_with_meta = (
+                    f"{answer}\n\nConfidence: {confidence}\nMode: {mode_used}"
+                    f"\nMemory hit: {memory_hit}\nMemory written: {memory_written}"
+                    f"\nCitation gate passed: {citation_gate_passed}\nGuardrail triggered: {guardrail_triggered}"
+                )
                 set_output_message(answer_with_meta.replace("\n", "<br />"))
                 set_output_urls(format_related_links(citations, cleaned_input, answer, max_links=2))
 
@@ -397,6 +424,16 @@ def Page():
             file_handle.write(content)
         retrieval_chain_body = load_pdf_vector(file_path)
 
+    def clear_memory_for_session():
+        """
+        Clear memory records for active session id.
+        """
+        active_session = (session_id.value or "default").strip() or "default"
+        result = clear_memory(active_session)
+        set_memory_status(
+            f"Cleared {result.get('cleared_count', 0)} memory entries for session `{active_session}`."
+        )
+
     content, set_content = solara.use_state(b"")
     filename, set_filename = solara.use_state("")
     size, set_size = solara.use_state(0)
@@ -406,6 +443,14 @@ def Page():
             solara.Select(label="Select Model", value=llm, values=llms, on_value=on_value_change_llm)
             solara.Select(label="Assistant Mode", value=assistant_mode, values=["rag", "agentic"])
             solara.Switch(label="Show Tool Timeline", value=show_timeline)
+            solara.Switch(label="Enable Memory", value=memory_enabled)
+            solara.Select(label="Memory Top K", value=memory_top_k, values=[1, 2, 3, 4, 5])
+            session_id_field = v.TextField(
+                v_model=session_id.value,
+                label="Session ID",
+                on_v_model=on_session_id_change
+            )
+            solara.Button(label="Clear Memory", on_click=clear_memory_for_session)
 
             solara.Switch(
                 label="Notion",
@@ -437,7 +482,9 @@ def Page():
             solara.Markdown(
                 """ **Use Agentic mode for release-readiness and latest-status questions.**
 **Use RAG mode for strict corpus-grounded Q&A or PDF uploads.**<br />
+Enable memory only when you want session personalization and continuity.<br />
 Example (Agentic): "Give me latest blockers for release X with Jira, GitHub and Notion evidence."<br />
+Example (Memory): "Remember that my preferred release timezone is PST."<br />
 Example (RAG): "Summarize what we documented about onboarding from Notion docs."<br />
 The assistant remains read-only for external systems.
 """
@@ -453,5 +500,7 @@ The assistant remains read-only for external systems.
 
         solara.Markdown(output_message)
         solara.Markdown(output_urls)
+        if memory_status:
+            solara.Markdown(memory_status.replace("\n", "<br />"))
         if show_timeline.value:
             solara.Markdown(output_timeline)

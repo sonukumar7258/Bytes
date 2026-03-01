@@ -23,6 +23,8 @@ Bytes is a hybrid AI assistant designed to streamline access to company knowledg
 - **Agentic Mode (RAG + MCP-style tools)**: Adds an orchestrated agent loop that can route between local corpus retrieval and live read-only tools for GitHub, Jira, and Notion.
 - **Release Readiness Brief**: Specialized agent workflow to summarize release status, blockers, risks, and next actions with evidence links.
 - **Tool Timeline Transparency**: UI panel shows planning/tool/synthesis steps with status and duration for interview walkthroughs.
+- **Opt-in Session Memory**: Agentic mode can store and retrieve session-scoped preferences/context with TTL-based retention and manual clear controls.
+- **Guardrail Layer**: Adds input injection checks, output citation gating for freshness-sensitive answers, and memory safety filtering.
 
 ## Why RAG-only is not enough here
 - **RAG is snapshot-based**: A local vector store is excellent for stable documentation, but it can lag behind current Jira/GitHub/Notion state unless constantly re-indexed.
@@ -104,10 +106,10 @@ That's it! You should now have the chatbot up and running.
 Run deterministic interview scenarios and export a markdown demo report:
 
 ```
-python evaluate_agentic.py --model gemini --sources notion jira github --output agentic_demo_report.md
+python evaluate_agentic.py --model gemini --sources notion jira github --memory on --session-id demo-session --output agentic_demo_report.md
 ```
 
-This report tracks tool-choice correctness, citation presence, freshness behavior, and hallucination heuristics.
+This report now tracks tool-choice correctness, citation presence, freshness behavior, memory-hit behavior, guardrail triggers, citation-gate pass rate, personalization correctness, and hallucination heuristics.
 
 
 # Methodology and approach
@@ -142,18 +144,23 @@ Bytes is composed of modular components that support both retrieval and agent or
 
 ### Agentic Runtime
 - **Intent Classification**: Query is classified into categories such as knowledge lookup, freshness lookup, release readiness, or write-like intent.
-- **Strategy Selection**: Runtime chooses `corpus_first`, `live_first`, `hybrid`, or `reject` (for write requests in read-only mode).
+- **Input Guardrail Node**: Prompt-injection-like patterns are detected before strategy and tool execution.
+- **Session Memory Node (Opt-in)**: Retrieves top-k memory snippets (`search_memory`) scoped by `session_id`.
+- **Strategy Selection**: Runtime chooses `corpus_first`, `live_first`, `hybrid`, `reject`, or `reject_guardrail`.
 - **Tool Execution Layer**:
   - `search_corpus` for local retrieval,
-  - `mcp_jira_read`, `mcp_github_read`, `mcp_notion_read` for live reads.
+  - `mcp_jira_read`, `mcp_github_read`, `mcp_notion_read` for live reads,
+  - `search_memory` and post-synthesis `write_memory` for memory persistence.
 - **MCP-style Client Wrapper**: External tool calls include allowlisting, retries, and timeout control.
-- **Synthesis and Citations**: Final answer is generated from collected evidence with links, confidence, and an optional timeline of steps.
-- **Guardrails**: Write-like actions are blocked by policy and converted into safe read-only responses.
+- **Synthesis and Citations**: Final answer is generated from live evidence + corpus + optional memory, with links, confidence, and an optional timeline of steps.
+- **Output Guardrail Node**: Freshness-sensitive responses without citations are blocked by citation gate.
+- **Memory Safety Filter**: Candidate memory text is sanitized/redacted before persistence.
 
 ### UI and Interaction
 - **Mode Switching**: User can switch between `rag` and `agentic` modes from the Solara sidebar.
 - **Model Switching**: Runtime model switching supports Gemini, Llama family, Qwen, and Kimi options.
 - **Tool Timeline View**: Agentic mode can show planning/tool/synthesis steps with durations.
+- **Memory Controls**: `Enable Memory` toggle, `Session ID`, and `Clear Memory` button are available in sidebar.
 - **PDF Path**: Uploaded PDF creates an in-memory/local vector retrieval chain for ad-hoc Q&A.
 
 ## Operational Flow
@@ -166,7 +173,7 @@ Bytes is composed of modular components that support both retrieval and agent or
 
 3. **Execution Path**
 - **RAG mode**: retrieve -> answer -> fallback (if needed) -> link ranking.
-- **Agentic mode**: classify -> decide strategy -> call tools -> synthesize -> cite -> timeline.
+- **Agentic mode**: classify -> input guardrail -> memory retrieve (opt-in) -> decide strategy -> call tools -> synthesize -> cite -> output guardrail -> memory persist (opt-in) -> timeline.
 
 4. **Response Rendering**
 - UI displays answer text, related links, optional timeline, and confidence metadata (agentic path).
@@ -177,7 +184,12 @@ Bytes is composed of modular components that support both retrieval and agent or
   - tool-choice correctness,
   - citation presence,
   - freshness correctness,
+  - memory-hit behavior,
+  - citation-gate pass rate,
+  - guardrail trigger behavior,
+  - personalization correctness,
   - hallucination heuristics.
 - **Report Export**: Generates a markdown report for interview demonstration.
+- **Architecture Artifact**: `ARCHITECTURE_NEXT.md` documents baseline vs upgraded architecture and tradeoffs.
 
 This methodology enables Bytes to operate as a practical production-style assistant: reliable for static knowledge retrieval while also capable of runtime, multi-tool reasoning for dynamic business questions.
