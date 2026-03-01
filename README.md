@@ -1,14 +1,3 @@
-## Demo Video
-
-
-
-
-https://github.com/ByteCorp-Tech/2024-AI-Challenge-Miraculum-generationis/assets/28065322/edb7520a-a535-4a58-a09c-6fc063eb3ce3
-
-
-
-
-
 # Bytes
 
 Bytes is a hybrid AI assistant designed to streamline access to company knowledge across Jira, GitHub, Notion, and internal website content. Users can also upload PDFs for ad-hoc Q&A. It is built in Python with Solara UI, LangChain retrieval, and an agentic runtime that can orchestrate runtime tool calls.
